@@ -4,6 +4,9 @@ const bip39 = require('bip39');
 const axios = require('axios');
 require("dotenv").config();
 
+// Konstanta untuk menjaga saldo minimum di akun pengirim
+const MIN_RESERVE_FOR_FEES = 0.3; // Jumlah Pi yang akan ditinggalkan di akun pengirim
+
 /**
  * @function sendTelegramMessage
  * @description Mengirim pesan notifikasi ke Telegram.
@@ -49,120 +52,190 @@ async function getPiWalletAddressFromSeed(mnemonic) {
 
 /**
  * @function claimAndSend
- * @description Fungsi utama untuk mengklaim saldo yang dapat diklaim dan mentransfernya dalam batch.
- * Ini akan mengklaim hingga 25 saldo yang dapat diklaim dan mengirimkannya
- * dalam satu transaksi tunggal.
+ * @description Fungsi utama untuk mengklaim saldo yang dapat diklaim dan mentransfernya dalam batch,
+ * lalu menguras semua saldo Pi yang tersisa ke alamat penerima.
+ * Biaya transaksi dibayar oleh akun sponsor.
  */
 async function claimAndSend() {
     const mnemonic = process.env.MNEMONIC;
     const receiver = process.env.RECEIVER_ADDRESS;
+    // Variabel lingkungan baru untuk mnemonik sponsor
+    const sponsorMnemonic = process.env.SPONSOR_MNEMONIC;
 
-    if (!mnemonic || !receiver) {
-        console.error("❌ Pastikan MNEMONIC dan RECEIVER_ADDRESS diatur di file .env Anda.");
+    if (!mnemonic || !receiver || !sponsorMnemonic) {
+        console.error("❌ Pastikan MNEMONIC, RECEIVER_ADDRESS, dan SPONSOR_MNEMONIC diatur di file .env Anda.");
+        // Hentikan eksekusi jika variabel lingkungan tidak diatur
         return;
     }
 
     try {
-        // Mendapatkan public dan secret key dari mnemonik
+        // Mendapatkan public dan secret key dari mnemonik pengirim
         const { publicKey, secretKey } = await getPiWalletAddressFromSeed(mnemonic);
+        // Membuat keypair pengirim dari secret key
+        const keypair = StellarSdk.Keypair.fromSecret(secretKey);
+
+        // Mendapatkan public dan secret key dari mnemonik sponsor
+        const { publicKey: sponsorPublicKey, secretKey: sponsorSecretKey } = await getPiWalletAddressFromSeed(sponsorMnemonic);
+        // Membuat keypair sponsor dari secret key sponsor
+        const sponsorKeypair = StellarSdk.Keypair.fromSecret(sponsorSecretKey);
+
         // Inisialisasi server Stellar untuk Pi Network
         const server = new StellarSdk.Server('https://api.mainnet.minepi.com');
-        // Membuat keypair dari secret key untuk penandatanganan transaksi
-        const keypair = StellarSdk.Keypair.fromSecret(secretKey);
 
         console.log("🔑 Sender Public Key:", publicKey);
         console.log("🎯 Receiver Address:", receiver);
+        console.log("💸 Sponsor Public Key:", sponsorPublicKey);
 
         // Memuat detail akun pengirim
-        const account = await server.loadAccount(publicKey);
-        console.log(`✅ Akun ${publicKey} berhasil dimuat. Urutan: ${account.sequence}`);
+        let account = await server.loadAccount(publicKey);
+        console.log(`✅ Akun pengirim ${publicKey} berhasil dimuat. Urutan: ${account.sequence}`);
+
+        // Memuat detail akun sponsor
+        let sponsorAccount = await server.loadAccount(sponsorPublicKey);
+        console.log(`✅ Akun sponsor ${sponsorPublicKey} berhasil dimuat. Urutan: ${sponsorAccount.sequence}`);
 
         // Mengambil semua saldo yang dapat diklaim untuk akun pengirim
         const claimables = await server.claimableBalances().claimant(publicKey).call();
 
         if (claimables.records.length === 0) {
             console.log("ℹ️ Tidak ada saldo yang dapat diklaim ditemukan untuk akun ini.");
-            // Lanjutkan untuk menjalankan lagi setelah jeda
-            return;
-        }
-
-        // Mengambil biaya dasar jaringan sekali
-        const baseFee = (await server.fetchBaseFee()).toString();
-        console.log(`💰 Menggunakan biaya dasar: ${baseFee} (dibayar oleh pengirim)`);
-
-        // Inisialisasi pembangun transaksi dengan akun pengirim, biaya, dan frasa jaringan
-        let transactionBuilder = new StellarSdk.TransactionBuilder(account, {
-            fee: baseFee,
-            networkPassphrase: 'Pi Network'
-        });
-
-        let operationsAdded = 0;
-        const maxOperationsPerTransaction = 25; // Batas untuk pasangan klaim/pembayaran (total 50 operasi)
-
-        // Iterasi melalui saldo yang dapat diklaim dan tambahkan operasi ke transaksi
-        for (let cb of claimables.records) {
-            // Batasi jumlah operasi untuk menghindari ukuran transaksi yang berlebihan
-            if (operationsAdded >= maxOperationsPerTransaction) {
-                console.log(`ℹ️ Mencapai batas ${maxOperationsPerTransaction} pasangan klaim/pembayaran. Memproses batch saat ini.`);
-                break; // Hentikan penambahan operasi jika batas tercapai
-            }
-
-            const cbID = cb.id;
-            const amount = cb.amount;
-            const assetType = cb.asset_type;
-            const assetCode = cb.asset_code;
-            const assetIssuer = cb.asset_issuer;
-
-            console.log(`✨ Menyiapkan untuk mengklaim Saldo ID: ${cbID} (Jumlah: ${amount} ${assetType === 'native' ? 'XLM' : assetCode})`);
-
-            // Menentukan aset (native atau dikeluarkan)
-            let asset;
-            if (assetType === 'native') {
-                asset = StellarSdk.Asset.native();
-            } else {
-                asset = new StellarSdk.Asset(assetCode, assetIssuer);
-            }
-
-            // Tambahkan operasi klaim saldo yang dapat diklaim
-            transactionBuilder.addOperation(StellarSdk.Operation.claimClaimableBalance({
-                balanceId: cbID,
-                source: publicKey // Akun sumber untuk operasi klaim
-            }));
-
-            // Tambahkan operasi pembayaran untuk jumlah yang diklaim ke penerima
-            transactionBuilder.addOperation(StellarSdk.Operation.payment({
-                destination: receiver,
-                asset: asset,
-                amount: amount,
-                source: publicKey // Akun sumber untuk operasi pembayaran
-            }));
-
-            operationsAdded++;
-        }
-
-        // Jika tidak ada operasi yang ditambahkan (misalnya, setelah filter batas), keluar
-        if (operationsAdded === 0) {
-            console.log("ℹ️ Tidak ada operasi klaim/transfer yang ditambahkan ke transaksi batch.");
-            return;
-        }
-
-        // Atur batas waktu transaksi dan bangun transaksi
-        let tx = transactionBuilder.setTimeout(30).build(); // Transaksi valid selama 30 detik
-
-        // Tandatangani transaksi dengan keypair pengirim
-        tx.sign(keypair);
-
-        console.log(`🚀 Mengirimkan transaksi batch dengan ${operationsAdded} pasangan klaim/pembayaran...`);
-        // Kirim transaksi ke jaringan Stellar
-        const res = await server.submitTransaction(tx);
-
-        // Tangani hasil transaksi
-        if (res && res.hash) {
-            console.log(`✅ Transaksi batch sukses! Hash: ${res.hash}`);
-            await sendTelegramMessage(`✅ Klaim & Transfer Pi sukses!\nTx Hash: ${res.hash}\nJumlah operasi: ${operationsAdded} pasangan.`);
         } else {
-            console.log("⚠️ Transaksi batch terkirim tapi tidak ada hash (kemungkinan tidak berhasil).");
-            await sendTelegramMessage(`⚠️ Klaim & Transfer Pi gagal atau tanpa hash.\nJumlah operasi: ${operationsAdded} pasangan.`);
+            // Mengambil biaya dasar jaringan sekali
+            const baseFee = (await server.fetchBaseFee()).toString();
+            console.log(`💰 Menggunakan biaya dasar: ${baseFee} (dibayar oleh sponsor)`);
+
+            // Inisialisasi pembangun transaksi dengan AKUN SPONSOR sebagai sumber.
+            // Ini berarti biaya transaksi akan dibayar oleh akun sponsor.
+            let transactionBuilder = new StellarSdk.TransactionBuilder(sponsorAccount, {
+                fee: baseFee,
+                networkPassphrase: 'Pi Network'
+            });
+
+            let operationsAdded = 0;
+            const maxOperationsPerTransaction = 25; // Batas untuk pasangan klaim/pembayaran (total 50 operasi)
+
+            // Iterasi melalui saldo yang dapat diklaim dan tambahkan operasi ke transaksi
+            for (let cb of claimables.records) {
+                // Batasi jumlah operasi untuk menghindari ukuran transaksi yang berlebihan
+                if (operationsAdded >= maxOperationsPerTransaction) {
+                    console.log(`ℹ️ Mencapai batas ${maxOperationsPerTransaction} pasangan klaim/pembayaran. Memproses batch saat ini.`);
+                    break; // Hentikan penambahan operasi jika batas tercapai
+                }
+
+                const cbID = cb.id;
+                const amount = cb.amount;
+                const assetType = cb.asset_type;
+                const assetCode = cb.asset_code;
+                const assetIssuer = cb.asset_issuer;
+
+                console.log(`✨ Menyiapkan untuk mengklaim Saldo ID: ${cbID} (Jumlah: ${amount} ${assetType === 'native' ? 'XLM' : assetCode})`);
+
+                // Menentukan aset (native atau dikeluarkan)
+                let asset;
+                if (assetType === 'native') {
+                    asset = StellarSdk.Asset.native();
+                } else {
+                    asset = new StellarSdk.Asset(assetCode, assetIssuer);
+                }
+
+                // Tambahkan operasi klaim saldo yang dapat diklaim.
+                // Sumber operasi adalah akun pengirim (publicKey) karena operasi ini memengaruhi saldo pengirim.
+                transactionBuilder.addOperation(StellarSdk.Operation.claimClaimableBalance({
+                    balanceId: cbID,
+                    source: publicKey
+                }));
+
+                // Tambahkan operasi pembayaran untuk jumlah yang diklaim ke penerima.
+                // Sumber operasi adalah akun pengirim (publicKey) karena ini adalah transfer dari pengirim.
+                transactionBuilder.addOperation(StellarSdk.Operation.payment({
+                    destination: receiver,
+                    asset: asset,
+                    amount: amount,
+                    source: publicKey
+                }));
+
+                operationsAdded++;
+            }
+
+            // Jika ada operasi yang ditambahkan, kirim transaksi batch
+            if (operationsAdded > 0) {
+                // Atur batas waktu transaksi dan bangun transaksi
+                let tx = transactionBuilder.setTimeout(30).build(); // Transaksi valid selama 30 detik
+
+                // Tandatangani transaksi dengan keypair sponsor (untuk membayar biaya)
+                tx.sign(sponsorKeypair);
+                // Tandatangani transaksi dengan keypair pengirim (karena operasi bersumber dari akun pengirim)
+                tx.sign(keypair);
+
+                console.log(`🚀 Mengirimkan transaksi batch dengan ${operationsAdded} pasangan klaim/pembayaran...`);
+                // Kirim transaksi ke jaringan Stellar
+                const res = await server.submitTransaction(tx);
+
+                // Tangani hasil transaksi
+                if (res && res.hash) {
+                    console.log(`✅ Transaksi batch sukses! Hash: ${res.hash}`);
+                    await sendTelegramMessage(`✅ Klaim & Transfer Pi sukses (fee dibayar sponsor)!\nTx Hash: ${res.hash}\nJumlah operasi: ${operationsAdded} pasangan.`);
+                } else {
+                    console.log("⚠️ Transaksi batch terkirim tapi tidak ada hash (kemungkinan tidak berhasil).");
+                    await sendTelegramMessage(`⚠️ Klaim & Transfer Pi gagal atau tanpa hash (fee dibayar sponsor).\nJumlah operasi: ${operationsAdded} pasangan.`);
+                }
+            } else {
+                console.log("ℹ️ Tidak ada operasi klaim/transfer yang ditambahkan ke transaksi batch.");
+            }
+        }
+
+        // --- Bagian baru: Menguras semua saldo Pi yang tersisa ---
+        console.log("--- Memeriksa saldo Pi yang tersisa untuk pengurasan ---");
+        // Muat ulang akun pengirim untuk mendapatkan saldo terbaru setelah klaim
+        account = await server.loadAccount(publicKey);
+        const currentNativeBalance = parseFloat(account.balances.find(b => b.asset_type === 'native')?.balance || '0');
+
+        console.log(`📊 Saldo Pi saat ini di akun pengirim: ${currentNativeBalance}`);
+
+        // Hitung jumlah yang akan dikirim, menyisakan MIN_RESERVE_FOR_FEES
+        const amountToSweep = currentNativeBalance - MIN_RESERVE_FOR_FEES;
+
+        if (amountToSweep > 0) {
+            console.log(`💸 Menyiapkan untuk menguras ${amountToSweep.toFixed(7)} Pi dari ${publicKey} ke ${receiver}`);
+
+            const baseFeeForSweep = (await server.fetchBaseFee()).toString();
+            console.log(`💰 Menggunakan biaya dasar untuk pengurasan: ${baseFeeForSweep} (dibayar oleh sponsor)`);
+
+            // Muat ulang akun sponsor untuk mendapatkan urutan terbaru sebelum membuat transaksi baru
+            sponsorAccount = await server.loadAccount(sponsorPublicKey);
+
+            // Buat transaksi pembayaran terpisah untuk menguras saldo.
+            // Transaksi ini juga dibangun dari akun sponsor untuk membayar biaya.
+            const sweepTx = new StellarSdk.TransactionBuilder(sponsorAccount, {
+                fee: baseFeeForSweep,
+                networkPassphrase: 'Pi Network'
+            })
+                .addOperation(StellarSdk.Operation.payment({
+                    destination: receiver,
+                    asset: StellarSdk.Asset.native(),
+                    amount: amountToSweep.toFixed(7), // Format ke 7 desimal
+                    source: publicKey // Sumber pembayaran adalah akun pengirim
+                }))
+                .setTimeout(30)
+                .build();
+
+            // Tandatangani transaksi pengurasan dengan keypair sponsor
+            sweepTx.sign(sponsorKeypair);
+            // Tandatangani transaksi pengurasan dengan keypair pengirim (karena operasi bersumber dari akun pengirim)
+            sweepTx.sign(keypair);
+
+            console.log("🚀 Mengirimkan transaksi pengurasan saldo...");
+            const sweepResult = await server.submitTransaction(sweepTx);
+
+            if (sweepResult && sweepResult.hash) {
+                console.log(`✅ Pengurasan saldo sukses! Hash: ${sweepResult.hash}`);
+                await sendTelegramMessage(`✅ Pengurasan saldo Pi sukses (fee dibayar sponsor)!\nJumlah: ${amountToSweep.toFixed(7)} Pi\nTx Hash: ${sweepResult.hash}`);
+            } else {
+                console.log("⚠️ Pengurasan saldo gagal: transaksi tidak valid atau tanpa hash.");
+                await sendTelegramMessage(`⚠️ Pengurasan saldo Pi gagal atau tanpa hash (fee dibayar sponsor).\nJumlah: ${amountToSweep.toFixed(7)} Pi`);
+            }
+        } else {
+            console.log("ℹ️ Saldo tidak cukup untuk pengurasan setelah menyisakan biaya.");
         }
 
     } catch (e) {
@@ -179,7 +252,7 @@ async function claimAndSend() {
         // Ulangi fungsi setelah jeda singkat
         console.log("🔄 Menunggu 1 detik sebelum menjalankan lagi...");
         console.log("----------------------------------------------------------------");
-        setTimeout(claimAndSend, 1000); // ulangi setiap 1 detik
+        setTimeout(claimAndSend, 449); // ulangi setiap 1 detik
     }
 }
 
